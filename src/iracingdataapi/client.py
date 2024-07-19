@@ -3,13 +3,14 @@ import hashlib
 import time
 from datetime import datetime
 
-import requests
+import aiohttp
+import asyncio
 
 
 class irDataClient:
     def __init__(self, username=None, password=None):
         self.authenticated = False
-        self.session = requests.Session()
+        self.session = aiohttp.ClientSession()
         self.base_url = "https://members-ng.iracing.com"
 
         self.username = username
@@ -22,17 +23,24 @@ class irDataClient:
 
         return base64.b64encode(initial_hash).decode("utf-8")
 
-    def _login(self):
+    async def _login(self):
         headers = {"Content-Type": "application/json"}
         data = {"email": self.username, "password": self.encoded_password}
+        r: aiohttp.ClientResponse = None
 
-        try:
-            r = self.session.post(
-                "https://members-ng.iracing.com/auth",
-                headers=headers,
-                json=data,
-                timeout=5.0,
-            )
+        async with self.session:
+            try:
+                r = await self.session.post(
+                    "https://members-ng.iracing.com/auth",
+                    headers=headers,
+                    json=data,
+                    timeout=5.0,
+                )
+            except asyncio.TimeoutError:
+                raise RuntimeError("Login timed out")
+            except aiohttp.ClientConnectionError:
+                raise RuntimeError("Connection error")
+
             if r.status_code == 429:
                 print("Rate limited, waiting")
                 ratelimit_reset = r.headers.get("x-ratelimit-reset")
@@ -41,13 +49,10 @@ class irDataClient:
                     delta = reset_datetime - datetime.now()
                     if delta.total_seconds() > 0:
                         time.sleep(delta.total_seconds())
-                return self._login()
-        except requests.Timeout:
-            raise RuntimeError("Login timed out")
-        except requests.ConnectionError:
-            raise RuntimeError("Connection error")
-        else:
-            response_data = r.json()
+                return await self._login()
+
+            response_data = await r.json()
+
             if r.status_code == 200 and response_data.get("authcode"):
                 self.authenticated = True
                 return "Logged in"
@@ -57,17 +62,20 @@ class irDataClient:
     def _build_url(self, endpoint):
         return self.base_url + endpoint
 
-    def _get_resource_or_link(self, url, payload=None):
+    async def _get_resource_or_link(self, url, payload=None):
         if not self.authenticated:
-            self._login()
-            return self._get_resource_or_link(url, payload=payload)
+            await self._login()
+            return await self._get_resource_or_link(url, payload=payload)
 
-        r = self.session.get(url, params=payload)
+        r: aiohttp.ClientResponse = None
+
+        async with self.session:
+            r = await self.session.get(url, params=payload)
 
         if r.status_code == 401:
             # unauthorised, likely due to a timeout, retry after a login
             self.authenticated = False
-            return self._get_resource_or_link(url, payload=payload)
+            return await self._get_resource_or_link(url, payload=payload)
 
         if r.status_code == 429:
             print("Rate limited, waiting")
@@ -77,27 +85,33 @@ class irDataClient:
                 delta = reset_datetime - datetime.now()
                 if delta.total_seconds() > 0:
                     time.sleep(delta.total_seconds())
-            return self._get_resource_or_link(url, payload=payload)
+            return await self._get_resource_or_link(url, payload=payload)
 
         if r.status_code != 200:
             raise RuntimeError("Unhandled Non-200 response", r)
-        data = r.json()
+        data = await r.json()
         if not isinstance(data, list) and "link" in data.keys():
             return [data.get("link"), True]
         else:
             return [data, False]
 
-    def _get_resource(self, endpoint, payload=None):
+    async def _get_resource(self, endpoint, payload=None):
         request_url = self._build_url(endpoint)
-        resource_obj, is_link = self._get_resource_or_link(request_url, payload=payload)
+        resource_obj, is_link = await self._get_resource_or_link(
+            request_url, payload=payload
+        )
         if not is_link:
             return resource_obj
-        r = self.session.get(resource_obj)
+
+        r: aiohttp.ClientResponse = None
+
+        async with self.session:
+            r = self.session.get(resource_obj)
 
         if r.status_code == 401:
             # unauthorised, likely due to a timeout, retry after a login
             self.authenticated = False
-            return self._get_resource(endpoint, payload=payload)
+            return await self._get_resource(endpoint, payload=payload)
 
         if r.status_code == 429:
             print("Rate limited, waiting")
@@ -107,20 +121,28 @@ class irDataClient:
                 delta = reset_datetime - datetime.now()
                 if delta.total_seconds() > 0:
                     time.sleep(delta.total_seconds())
-            return self._get_resource(endpoint, payload=payload)
+            return await self._get_resource(endpoint, payload=payload)
 
         if r.status_code != 200:
             raise RuntimeError("Unhandled Non-200 response", r)
 
-        return r.json()
+        return await r.json()
 
-    def _get_chunks(self, chunks):
+    async def _get_chunks(self, chunks):
         if not isinstance(chunks, dict):
             # if there are no chunks, return an empty list for compatibility
             return []
+
         base_url = chunks.get("base_download_url")
         urls = [base_url + x for x in chunks.get("chunk_file_names")]
-        list_of_chunks = [self.session.get(url).json() for url in urls]
+
+        list_of_chunks = []
+
+        async with self.session:
+            for url in urls:
+                r = await self.session.get(url)
+                list_of_chunks.append(await r.json())
+
         output = [item for sublist in list_of_chunks for item in sublist]
 
         return output
@@ -133,24 +155,24 @@ class irDataClient:
         return objects
 
     @property
-    def cars(self):
-        cars = self.get_cars()
-        car_assets = self.get_cars_assets()
+    async def cars(self):
+        cars = await self.get_cars()
+        car_assets = await self.get_cars_assets()
         return self._add_assets(cars, car_assets, "car_id")
 
     @property
-    def tracks(self):
-        tracks = self.get_tracks()
-        track_assets = self.get_tracks_assets()
+    async def tracks(self):
+        tracks = await self.get_tracks()
+        track_assets = await self.get_tracks_assets()
         return self._add_assets(tracks, track_assets, "track_id")
 
     @property
-    def series(self):
-        series = self.get_series()
-        series_assets = self.get_series_assets()
+    async def series(self):
+        series = await self.get_series()
+        series_assets = await self.get_series_assets()
         return self._add_assets(series, series_assets, "series_id")
 
-    def constants_categories(self):
+    async def constants_categories(self):
         """Fetches a list containing the racing categories.
 
         Retrieves a list containing the racing categories and
@@ -160,9 +182,9 @@ class irDataClient:
             list: A list of dicts representing each category.
 
         """
-        return self._get_resource("/data/constants/categories")
+        return await self._get_resource("/data/constants/categories")
 
-    def constants_divisions(self):
+    async def constants_divisions(self):
         """Fetches a list containing the racing divisions.
 
         Retrieves a list containing the racing divisions and
@@ -172,9 +194,9 @@ class irDataClient:
             list: A list of dicts representing each division.
 
         """
-        return self._get_resource("/data/constants/divisions")
+        return await self._get_resource("/data/constants/divisions")
 
-    def constants_event_types(self):
+    async def constants_event_types(self):
         """Fetches a list containing the event types.
 
         Retrieves a list containing the types of events (i.e. Practice,
@@ -184,9 +206,9 @@ class irDataClient:
             list: A list of dicts representing each event type.
 
         """
-        return self._get_resource("/data/constants/event_types")
+        return await self._get_resource("/data/constants/event_types")
 
-    def get_cars(self):
+    async def get_cars(self):
         """Fetches a list containing all the cars in the service.
 
         Retrieves a list containing each car in the service, with
@@ -195,9 +217,9 @@ class irDataClient:
         Returns:
             list: A list of dicts representing each car information.
         """
-        return self._get_resource("/data/car/get")
+        return await self._get_resource("/data/car/get")
 
-    def get_cars_assets(self):
+    async def get_cars_assets(self):
         """Fetches a list containing all the car assets in the service.
 
         Retrieves a list containing each car in the service, with
@@ -206,9 +228,9 @@ class irDataClient:
         Returns:
             list: A list of dicts representing assets from each car.
         """
-        return self._get_resource("/data/car/assets")
+        return await self._get_resource("/data/car/assets")
 
-    def get_carclasses(self):
+    async def get_carclasses(self):
         """Fetches a list containing all the car classes in the service.
 
         Retrieves a list containing each car class in the service, including
@@ -218,18 +240,18 @@ class irDataClient:
             list: A list of dicts representing assets from each car.
 
         """
-        return self._get_resource("/data/carclass/get")
+        return await self._get_resource("/data/carclass/get")
 
-    def get_carclass(self):
+    async def get_carclass(self):
         """
         get_carclass() is deprecated and will be removed in a future release, please use get_carclasses()
         """
         print(
             "get_carclass() is deprecated and will be removed in a future release, please use get_carclasses()"
         )
-        return self.get_carclasses()
+        return await self.get_carclasses()
 
-    def get_tracks(self):
+    async def get_tracks(self):
         """Fetches a list containing all the tracks in the service.
 
         Retrieves a list containing each track in the service, with
@@ -238,9 +260,9 @@ class irDataClient:
         Returns:
             list: A list of dicts representing each track information.
         """
-        return self._get_resource("/data/track/get")
+        return await self._get_resource("/data/track/get")
 
-    def get_tracks_assets(self):
+    async def get_tracks_assets(self):
         """Fetches a list containing all the track assets in the service.
 
         Retrieves a list containing each track in the service, with
@@ -249,9 +271,9 @@ class irDataClient:
         Returns:
             list: A list of dicts representing assets from each track.
         """
-        return self._get_resource("/data/track/assets")
+        return await self._get_resource("/data/track/assets")
 
-    def hosted_combined_sessions(self, package_id=None):
+    async def hosted_combined_sessions(self, package_id=None):
         """Fetches a dict containing the combined hosted sessions
 
         Retrieves a dict containing all the hosted sessions (available through ``sessions`` key)
@@ -270,9 +292,11 @@ class irDataClient:
         payload = {}
         if package_id:
             payload["package_id"] = package_id
-        return self._get_resource("/data/hosted/combined_sessions", payload=payload)
+        return await self._get_resource(
+            "/data/hosted/combined_sessions", payload=payload
+        )
 
-    def hosted_sessions(self):
+    async def hosted_sessions(self):
         """Fetches a dict containing the hosted sessions
 
         Retrieves a dict containing the hosted sessions (available through ``sessions`` key)
@@ -281,9 +305,9 @@ class irDataClient:
         Returns:
             dict: A dict containing all the combined hosted sessions.
         """
-        return self._get_resource("/data/hosted/sessions")
+        return await self._get_resource("/data/hosted/sessions")
 
-    def league_get(self, league_id=None, include_licenses=False):
+    async def league_get(self, league_id=None, include_licenses=False):
         """Fetches a dict containing information from the league requested.
 
         Retrieves a dict containing all the information of the league requested.
@@ -299,9 +323,9 @@ class irDataClient:
         if not league_id:
             raise RuntimeError("Please supply a league_id")
         payload = {"league_id": league_id, "include_licenses": include_licenses}
-        return self._get_resource("/data/league/get", payload=payload)
+        return await self._get_resource("/data/league/get", payload=payload)
 
-    def league_cust_league_sessions(self, mine=False, package_id=None):
+    async def league_cust_league_sessions(self, mine=False, package_id=None):
         """Fetches a dict containing information from the league requested.
 
         Retrieves a dict containing all the information of the league requested.
@@ -317,9 +341,9 @@ class irDataClient:
         if package_id:
             payload["package_id"] = package_id
 
-        return self._get_resource("/data/league/cust_league_sessions")
+        return await self._get_resource("/data/league/cust_league_sessions")
 
-    def league_directory(
+    async def league_directory(
         self,
         search="",
         tag="",
@@ -364,9 +388,9 @@ class irDataClient:
             if x != "self":
                 payload[x] = params[x]
 
-        return self._get_resource("/data/league/directory", payload=payload)
+        return await self._get_resource("/data/league/directory", payload=payload)
 
-    def league_get_points_systems(self, league_id, season_id=None):
+    async def league_get_points_systems(self, league_id, season_id=None):
         """Fetches a dict containing the point system from the league requested.
 
         Retrieves a dict containing all the information of the league requested.
@@ -384,9 +408,11 @@ class irDataClient:
         if season_id:
             payload["season_id"] = season_id
 
-        return self._get_resource("/data/league/get_points_systems", payload=payload)
+        return await self._get_resource(
+            "/data/league/get_points_systems", payload=payload
+        )
 
-    def league_membership(self, include_league=False):
+    async def league_membership(self, include_league=False):
         """Fetches a list containing all the leagues the user is currently a member.
 
         Retrieves a list containing all the leagues the user is member.
@@ -398,9 +424,9 @@ class irDataClient:
             list: A list containing all the leagues the user is member.
         """
         payload = {"include_league": include_league}
-        return self._get_resource("/data/league/membership", payload=payload)
+        return await self._get_resource("/data/league/membership", payload=payload)
 
-    def league_roster(self, league_id, include_licenses=False):
+    async def league_roster(self, league_id, include_licenses=False):
         """Fetches a dict containing information about the league roster.
         Args:
             league_id (int): the league to retrieve the roster
@@ -416,9 +442,9 @@ class irDataClient:
 
         resource = self._get_resource("/data/league/roster", payload=payload)
 
-        return self._get_resource_or_link(resource['data_url'])[0]
+        return await self._get_resource_or_link(resource["data_url"])[0]
 
-    def league_seasons(self, league_id, retired=False):
+    async def league_seasons(self, league_id, retired=False):
         """Fetches a list containing all the seasons from a league.
 
         Retrieves a list containing all the seasons from a league.
@@ -431,9 +457,9 @@ class irDataClient:
             list: A list containing all the seasons from a league.
         """
         payload = {"league_id": league_id, "retired": retired}
-        return self._get_resource("/data/league/seasons", payload=payload)
+        return await self._get_resource("/data/league/seasons", payload=payload)
 
-    def league_season_standings(
+    async def league_season_standings(
         self, league_id, season_id, car_class_id=None, car_id=None
     ):
         """Fetches a dict containing all the seasons from a league.
@@ -457,9 +483,11 @@ class irDataClient:
         if car_id:
             payload["car_id"] = car_id
 
-        return self._get_resource("/data/league/season_standings", payload=payload)
+        return await self._get_resource(
+            "/data/league/season_standings", payload=payload
+        )
 
-    def league_season_sessions(self, league_id, season_id, results_only=False):
+    async def league_season_sessions(self, league_id, season_id, results_only=False):
         """Fetches a dict containing all the sessions from a league session.
 
         Retrieves a dict containing all the sessions from a league session.
@@ -477,9 +505,9 @@ class irDataClient:
             "season_id": season_id,
             "results_only": results_only,
         }
-        return self._get_resource("/data/league/season_sessions", payload=payload)
+        return await self._get_resource("/data/league/season_sessions", payload=payload)
 
-    def lookup_club_history(self, season_year, season_quarter):
+    async def lookup_club_history(self, season_year, season_quarter):
         """The club history for a year and season.
 
         Note: returns an earlier history if requested quarter does not have a club history
@@ -493,18 +521,18 @@ class irDataClient:
 
         """
         payload = {"season_year": season_year, "season_quarter": season_quarter}
-        return self._get_resource("/data/lookup/club_history", payload=payload)
+        return await self._get_resource("/data/lookup/club_history", payload=payload)
 
-    def lookup_countries(self):
+    async def lookup_countries(self):
         """The list of country names and the country codes.
 
         Returns:
             list: a list containing all the country names and country codes.
 
         """
-        return self._get_resource("/data/lookup/countries")
+        return await self._get_resource("/data/lookup/countries")
 
-    def lookup_drivers(self, search_term=None, league_id=None):
+    async def lookup_drivers(self, search_term=None, league_id=None):
         """Lookup for drivers given a search term.
 
         Retrieves a list of drivers given a search term. It can be narrowed
@@ -522,12 +550,12 @@ class irDataClient:
         if league_id:
             payload["league_id"] = league_id
 
-        return self._get_resource("/data/lookup/drivers", payload=payload)
+        return await self._get_resource("/data/lookup/drivers", payload=payload)
 
-    def lookup_get(self):
-        return self._get_resource("/data/lookup/get")
+    async def lookup_get(self):
+        return await self._get_resource("/data/lookup/get")
 
-    def lookup_licenses(self):
+    async def lookup_licenses(self):
         """All the iRacing licenses.
 
         Retrieves a list containing all the current licenses, from Rookie to Pro/WC.
@@ -536,9 +564,9 @@ class irDataClient:
             list: a list containing all the current licenses, from Rookie to Pro/WC.
 
         """
-        return self._get_resource("/data/lookup/licenses")
+        return await self._get_resource("/data/lookup/licenses")
 
-    def result(self, subsession_id=None, include_licenses=False):
+    async def result(self, subsession_id=None, include_licenses=False):
         """Get the results from a specific session.
 
         Get the results of a subsession, if authorized to view them.
@@ -558,9 +586,9 @@ class irDataClient:
             raise RuntimeError("Please supply a subsession_id")
 
         payload = {"subsession_id": subsession_id, "include_licenses": include_licenses}
-        return self._get_resource("/data/results/get", payload=payload)
+        return await self._get_resource("/data/results/get", payload=payload)
 
-    def result_lap_chart_data(self, subsession_id=None, simsession_number=0):
+    async def result_lap_chart_data(self, subsession_id=None, simsession_number=0):
         """Get all the lap data from a subsession.
 
         Retrieves all the lap data from all cars during a sim session (Practice,
@@ -583,9 +611,9 @@ class irDataClient:
             "simsession_number": simsession_number,
         }
         resource = self._get_resource("/data/results/lap_chart_data", payload=payload)
-        return self._get_chunks(resource.get("chunk_info"))
+        return await self._get_chunks(resource.get("chunk_info"))
 
-    def result_lap_data(
+    async def result_lap_data(
         self, subsession_id=None, simsession_number=0, cust_id=None, team_id=None
     ):
         """Get the lap data from a car within a sim session.
@@ -619,15 +647,15 @@ class irDataClient:
         if team_id:
             payload["team_id"] = team_id
 
-        resource = self._get_resource("/data/results/lap_data", payload=payload)
+        resource = await self._get_resource("/data/results/lap_data", payload=payload)
         if resource.get("chunk_info"):
-            return self._get_chunks(resource.get("chunk_info"))
+            return await self._get_chunks(resource.get("chunk_info"))
 
         # if there are no chunks to get, that's because no laps were done by this cust_id
         # on this subsession, return an empty list for compatibility
         return []
 
-    def result_event_log(self, subsession_id=None, simsession_number=0):
+    async def result_event_log(self, subsession_id=None, simsession_number=0):
         """Get all the logs from a result sim session.
 
         Retrieves a list of all events logged during a sim event (Practice, Qualifying, Race)...
@@ -647,10 +675,10 @@ class irDataClient:
             "subsession_id": subsession_id,
             "simsession_number": simsession_number,
         }
-        resource = self._get_resource("/data/results/event_log", payload=payload)
-        return self._get_chunks(resource.get("chunk_info"))
+        resource = await self._get_resource("/data/results/event_log", payload=payload)
+        return await self._get_chunks(resource.get("chunk_info"))
 
-    def result_search_hosted(
+    async def result_search_hosted(
         self,
         start_range_begin=None,
         start_range_end=None,
@@ -708,10 +736,13 @@ class irDataClient:
             if x != "self" and params[x]:
                 payload[x] = params[x]
 
-        resource = self._get_resource("/data/results/search_hosted", payload=payload)
-        return self._get_chunks(resource.get("data", dict()).get("chunk_info"))
+        resource = await self._get_resource(
+            "/data/results/search_hosted", payload=payload
+        )
 
-    def result_search_series(
+        return await self._get_chunks(resource.get("data", dict()).get("chunk_info"))
+
+    async def result_search_series(
         self,
         season_year=None,
         season_quarter=None,
@@ -769,10 +800,15 @@ class irDataClient:
             if x != "self" and params[x]:
                 payload[x] = params[x]
 
-        resource = self._get_resource("/data/results/search_series", payload=payload)
-        return self._get_chunks(resource.get("data", dict()).get("chunk_info"))
+        resource = await self._get_resource(
+            "/data/results/search_series", payload=payload
+        )
 
-    def result_season_results(self, season_id, event_type=None, race_week_num=None):
+        return await self._get_chunks(resource.get("data", dict()).get("chunk_info"))
+
+    async def result_season_results(
+        self, season_id, event_type=None, race_week_num=None
+    ):
         """Get results from a certain race week from a series season.
 
         Args:
@@ -790,9 +826,9 @@ class irDataClient:
         if race_week_num:
             payload["race_week_num"] = race_week_num
 
-        return self._get_resource("/data/results/season_results", payload=payload)
+        return await self._get_resource("/data/results/season_results", payload=payload)
 
-    def member(self, cust_id=None, include_licenses=False):
+    async def member(self, cust_id=None, include_licenses=False):
         """Get member profile basic information from one or more members.
 
         Args:
@@ -810,9 +846,9 @@ class irDataClient:
             raise RuntimeError("Please supply a cust_id")
 
         payload = {"cust_ids": cust_id, "include_licenses": include_licenses}
-        return self._get_resource("/data/member/get", payload=payload)
+        return await self._get_resource("/data/member/get", payload=payload)
 
-    def member_awards(self, cust_id=None):
+    async def member_awards(self, cust_id=None):
         """Fetches a dict containing information on the members awards.
         Args:
             cust_id (int): the iRacing cust_id. Defaults to the authenticated member.
@@ -824,11 +860,11 @@ class irDataClient:
         if cust_id:
             payload["cust_id"] = cust_id
 
-        resource = self._get_resource("/data/member/awards", payload=payload)
+        resource = await self._get_resource("/data/member/awards", payload=payload)
 
-        return self._get_resource_or_link(resource['data_url'])[0]
+        return await self._get_resource_or_link(resource["data_url"])[0]
 
-    def member_chart_data(self, cust_id=None, category_id=2, chart_type=1):
+    async def member_chart_data(self, cust_id=None, category_id=2, chart_type=1):
         """Get the irating, ttrating or safety rating chart data of a certain category.
 
         Args:
@@ -844,18 +880,18 @@ class irDataClient:
         if cust_id:
             payload["cust_id"] = cust_id
 
-        return self._get_resource("/data/member/chart_data", payload=payload)
+        return await self._get_resource("/data/member/chart_data", payload=payload)
 
-    def member_info(self):
+    async def member_info(self):
         """Account info from the authenticated member.
 
         Returns:
             dict: a dict containing the detailed information from the authenticated member.
 
         """
-        return self._get_resource("/data/member/info")
+        return await self._get_resource("/data/member/info")
 
-    def member_profile(self, cust_id=None):
+    async def member_profile(self, cust_id=None):
         """Detailed profile info from a member.
 
         Args:
@@ -868,9 +904,9 @@ class irDataClient:
         payload = {}
         if cust_id:
             payload["cust_id"] = cust_id
-        return self._get_resource("/data/member/profile", payload=payload)
+        return await self._get_resource("/data/member/profile", payload=payload)
 
-    def stats_member_bests(self, cust_id=None, car_id=None):
+    async def stats_member_bests(self, cust_id=None, car_id=None):
         """Get the member best laptimes from a certain cust_id and car_id.
 
         Args:
@@ -888,9 +924,9 @@ class irDataClient:
         if car_id:
             payload["car_id"] = car_id
 
-        return self._get_resource("/data/stats/member_bests", payload=payload)
+        return await self._get_resource("/data/stats/member_bests", payload=payload)
 
-    def stats_member_career(self, cust_id=None):
+    async def stats_member_career(self, cust_id=None):
         """Get the member career stats from a certain cust_id
 
         Args:
@@ -903,9 +939,9 @@ class irDataClient:
         payload = {}
         if cust_id:
             payload["cust_id"] = cust_id
-        return self._get_resource("/data/stats/member_career", payload=payload)
+        return await self._get_resource("/data/stats/member_career", payload=payload)
 
-    def stats_member_recap(self, cust_id=None, year=None, quarter=None):
+    async def stats_member_recap(self, cust_id=None, year=None, quarter=None):
         """Get a recap for the member.
 
         Args:
@@ -923,9 +959,9 @@ class irDataClient:
             payload["year"] = year
         if quarter:
             payload["season"] = quarter
-        return self._get_resource("/data/stats/member_recap", payload=payload)
+        return await self._get_resource("/data/stats/member_recap", payload=payload)
 
-    def stats_member_recent_races(self, cust_id=None):
+    async def stats_member_recent_races(self, cust_id=None):
         """Get the latest member races from a certain cust_id
 
         Args:
@@ -939,9 +975,11 @@ class irDataClient:
         if cust_id:
             payload = {"cust_id": cust_id}
 
-        return self._get_resource("/data/stats/member_recent_races", payload=payload)
+        return await self._get_resource(
+            "/data/stats/member_recent_races", payload=payload
+        )
 
-    def stats_member_summary(self, cust_id=None):
+    async def stats_member_summary(self, cust_id=None):
         """Get the member stats summary from a certain cust_id
 
         Args:
@@ -955,9 +993,9 @@ class irDataClient:
         if cust_id:
             payload = {"cust_id": cust_id}
 
-        return self._get_resource("/data/stats/member_summary", payload=payload)
+        return await self._get_resource("/data/stats/member_summary", payload=payload)
 
-    def stats_member_yearly(self, cust_id=None):
+    async def stats_member_yearly(self, cust_id=None):
         """Get the member stats yearly from a certain cust_id
 
         Args:
@@ -971,9 +1009,9 @@ class irDataClient:
         if cust_id:
             payload = {"cust_id": cust_id}
 
-        return self._get_resource("/data/stats/member_yearly", payload=payload)
+        return await self._get_resource("/data/stats/member_yearly", payload=payload)
 
-    def stats_season_driver_standings(
+    async def stats_season_driver_standings(
         self, season_id, car_class_id, race_week_num=None, club_id=None, division=None
     ):
         """Get the driver standings from a season.
@@ -998,12 +1036,12 @@ class irDataClient:
         if division:
             payload["division"] = division
 
-        resource = self._get_resource(
+        resource = await self._get_resource(
             "/data/stats/season_driver_standings", payload=payload
         )
-        return self._get_chunks(resource.get("chunk_info"))
+        return await self._get_chunks(resource.get("chunk_info"))
 
-    def stats_season_supersession_standings(
+    async def stats_season_supersession_standings(
         self, season_id, car_class_id, race_week_num=None, club_id=None, division=None
     ):
         """Get the supersession standings from a season.
@@ -1028,12 +1066,15 @@ class irDataClient:
         if division:
             payload["division"] = division
 
-        resource = self._get_resource(
+        resource = await self._get_resource(
             "/data/stats/season_supersession_standings", payload=payload
         )
-        return self._get_chunks(resource.get("chunk_info"))
 
-    def stats_season_team_standings(self, season_id, car_class_id, race_week_num=None):
+        return await self._get_chunks(resource.get("chunk_info"))
+
+    async def stats_season_team_standings(
+        self, season_id, car_class_id, race_week_num=None
+    ):
         """Get the team standings from a season.
 
         Args:
@@ -1049,12 +1090,13 @@ class irDataClient:
         if race_week_num:
             payload["race_week_num"] = race_week_num
 
-        resource = self._get_resource(
+        resource = await self._get_resource(
             "/data/stats/season_team_standings", payload=payload
         )
-        return self._get_chunks(resource.get("chunk_info"))
 
-    def stats_season_tt_standings(
+        return await self._get_chunks(resource.get("chunk_info"))
+
+    async def stats_season_tt_standings(
         self, season_id, car_class_id, race_week_num=None, club_id=None, division=None
     ):
         """Get the Time Trial standings from a season.
@@ -1078,12 +1120,13 @@ class irDataClient:
         if division:
             payload["division"] = division
 
-        resource = self._get_resource(
+        resource = await self._get_resource(
             "/data/stats/season_tt_standings", payload=payload
         )
-        return self._get_chunks(resource.get("chunk_info"))
 
-    def stats_season_tt_results(
+        return await self._get_chunks(resource.get("chunk_info"))
+
+    async def stats_season_tt_results(
         self, season_id, car_class_id, race_week_num, club_id=None, division=None
     ):
         """Get the Time Trial results from a season.
@@ -1109,10 +1152,13 @@ class irDataClient:
         if division:
             payload["division"] = division
 
-        resource = self._get_resource("/data/stats/season_tt_results", payload=payload)
-        return self._get_chunks(resource.get("chunk_info"))
+        resource = await self._get_resource(
+            "/data/stats/season_tt_results", payload=payload
+        )
 
-    def stats_season_qualify_results(
+        return await self._get_chunks(resource.get("chunk_info"))
+
+    async def stats_season_qualify_results(
         self, season_id, car_class_id, race_week_num, club_id=None, division=None
     ):
         """Get the qualifying results from a season.
@@ -1138,12 +1184,13 @@ class irDataClient:
         if division:
             payload["division"] = division
 
-        resource = self._get_resource(
+        resource = await self._get_resource(
             "/data/stats/season_qualify_results", payload=payload
         )
-        return self._get_chunks(resource.get("chunk_info"))
 
-    def stats_world_records(
+        return await self._get_chunks(resource.get("chunk_info"))
+
+    async def stats_world_records(
         self, car_id, track_id, season_year=None, season_quarter=None
     ):
         """Get the world records from a given track and car.
@@ -1164,10 +1211,13 @@ class irDataClient:
         if season_quarter:
             payload["season_quarter"] = season_quarter
 
-        resource = self._get_resource("/data/stats/world_records", payload=payload)
-        return self._get_chunks(resource.get("data", dict()).get("chunk_info"))
+        resource = await self._get_resource(
+            "/data/stats/world_records", payload=payload
+        )
 
-    def team(self, team_id, include_licenses=False):
+        return await self._get_chunks(resource.get("data", dict()).get("chunk_info"))
+
+    async def team(self, team_id, include_licenses=False):
         """Get detailed team information.
 
         Args:
@@ -1180,9 +1230,9 @@ class irDataClient:
 
         """
         payload = {"team_id": team_id, "include_licenses": include_licenses}
-        return self._get_resource("/data/team/get", payload=payload)
+        return await self._get_resource("/data/team/get", payload=payload)
 
-    def season_list(self, season_year, season_quarter):
+    async def season_list(self, season_year, season_quarter):
         """Get the list of iRacing Official seasons given a year and quarter.
 
         Args:
@@ -1194,9 +1244,9 @@ class irDataClient:
 
         """
         payload = {"season_year": season_year, "season_quarter": season_quarter}
-        return self._get_resource("/data/season/list", payload=payload)
+        return await self._get_resource("/data/season/list", payload=payload)
 
-    def season_race_guide(self, start_from=None, include_end_after_from=None):
+    async def season_race_guide(self, start_from=None, include_end_after_from=None):
         """Get the season schedule race guide.
 
         Args:
@@ -1215,9 +1265,9 @@ class irDataClient:
         if include_end_after_from:
             payload["include_end_after_from"] = include_end_after_from
 
-        return self._get_resource("/data/season/race_guide", payload=payload)
+        return await self._get_resource("/data/season/race_guide", payload=payload)
 
-    def season_spectator_subsessionids(self, event_types=[2, 3, 4, 5]):
+    async def season_spectator_subsessionids(self, event_types=[2, 3, 4, 5]):
         """Get the current list of subsession IDs for a given event type
 
         Args:
@@ -1234,20 +1284,20 @@ class irDataClient:
         if event_types:
             payload["event_types"] = ",".join([str(x) for x in event_types])
 
-        return self._get_resource(
+        return await self._get_resource(
             "/data/season/spectator_subsessionids", payload=payload
         )["subsession_ids"]
 
-    def get_series(self):
+    async def get_series(self):
         """Get all the current official iRacing series.
 
         Returns:
             list: a list containing all the official iRacing series.
 
         """
-        return self._get_resource("/data/series/get")
+        return await self._get_resource("/data/series/get")
 
-    def get_series_assets(self):
+    async def get_series_assets(self):
         """Get all the current official iRacing series assets.
 
         Get the images, description and logos from the current official iRacing series.
@@ -1257,16 +1307,16 @@ class irDataClient:
             dict: a dict containing all the current official iRacing series assets.
 
         """
-        return self._get_resource("/data/series/assets")
+        return await self._get_resource("/data/series/assets")
 
-    def series_assets(self):
+    async def series_assets(self):
         print(
             "series_assets() is deprecated and will be removed in a future release, "
             "please update to use get_series_assets"
         )
-        return self.get_series_assets()
+        return await self.get_series_assets()
 
-    def series_past_seasons(self, series_id):
+    async def series_past_seasons(self, series_id):
         """Get all seasons for a series.
 
         Filter list by ``'official'``: ``True`` for seasons with standings.
@@ -1278,9 +1328,12 @@ class irDataClient:
             dict: a dict containing information about the series and a list of seasons.
         """
         payload = {"series_id": series_id}
-        return self._get_resource("/data/series/past_seasons", payload=payload).get('series')
 
-    def series_seasons(self, include_series=False):
+        return await self._get_resource(
+            "/data/series/past_seasons", payload=payload
+        ).get("series")
+
+    async def series_seasons(self, include_series=False):
         """Get the all the seasons.
 
         To get series and seasons for which standings should be available, filter the list by ``'official'``: ``True``.
@@ -1293,9 +1346,9 @@ class irDataClient:
 
         """
         payload = {"include_series": include_series}
-        return self._get_resource("/data/series/seasons", payload=payload)
+        return await self._get_resource("/data/series/seasons", payload=payload)
 
-    def series_stats(self):
+    async def series_stats(self):
         """Get the all the series and seasons.
 
         To get series and seasons for which standings should be available, filter the list by ``'official'``: ``True``.
@@ -1304,4 +1357,4 @@ class irDataClient:
             list: a list containing all the series and seasons.
 
         """
-        return self._get_resource("/data/series/stats_series")
+        return await self._get_resource("/data/series/stats_series")
