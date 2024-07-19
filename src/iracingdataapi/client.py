@@ -41,7 +41,7 @@ class irDataClient:
             except aiohttp.ClientConnectionError:
                 raise RuntimeError("Connection error")
 
-            if r.status_code == 429:
+            if r.status == 429:
                 print("Rate limited, waiting")
                 ratelimit_reset = r.headers.get("x-ratelimit-reset")
                 if ratelimit_reset:
@@ -53,7 +53,7 @@ class irDataClient:
 
             response_data = await r.json()
 
-            if r.status_code == 200 and response_data.get("authcode"):
+            if r.status == 200 and response_data.get("authcode"):
                 self.authenticated = True
                 return "Logged in"
             else:
@@ -72,12 +72,12 @@ class irDataClient:
         async with self.session:
             r = await self.session.get(url, params=payload)
 
-        if r.status_code == 401:
+        if r.status == 401:
             # unauthorised, likely due to a timeout, retry after a login
             self.authenticated = False
             return await self._get_resource_or_link(url, payload=payload)
 
-        if r.status_code == 429:
+        if r.status == 429:
             print("Rate limited, waiting")
             ratelimit_reset = r.headers.get("x-ratelimit-reset")
             if ratelimit_reset:
@@ -87,7 +87,7 @@ class irDataClient:
                     time.sleep(delta.total_seconds())
             return await self._get_resource_or_link(url, payload=payload)
 
-        if r.status_code != 200:
+        if r.status != 200:
             raise RuntimeError("Unhandled Non-200 response", r)
         data = await r.json()
         if not isinstance(data, list) and "link" in data.keys():
@@ -108,12 +108,12 @@ class irDataClient:
         async with self.session:
             r = self.session.get(resource_obj)
 
-        if r.status_code == 401:
+        if r.status == 401:
             # unauthorised, likely due to a timeout, retry after a login
             self.authenticated = False
             return await self._get_resource(endpoint, payload=payload)
 
-        if r.status_code == 429:
+        if r.status == 429:
             print("Rate limited, waiting")
             ratelimit_reset = r.headers.get("x-ratelimit-reset")
             if ratelimit_reset:
@@ -123,7 +123,7 @@ class irDataClient:
                     time.sleep(delta.total_seconds())
             return await self._get_resource(endpoint, payload=payload)
 
-        if r.status_code != 200:
+        if r.status != 200:
             raise RuntimeError("Unhandled Non-200 response", r)
 
         return await r.json()
