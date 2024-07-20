@@ -11,7 +11,6 @@ class irDataClient:
     def __init__(self, username=None, password=None):
         self.authenticated = False
         self.session = None
-        self.session_factory = aiohttp.ClientSession
         self.base_url = "https://members-ng.iracing.com"
 
         self.username = username
