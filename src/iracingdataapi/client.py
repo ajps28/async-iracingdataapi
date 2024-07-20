@@ -10,11 +10,20 @@ import asyncio
 class irDataClient:
     def __init__(self, username=None, password=None):
         self.authenticated = False
-        self.session = aiohttp.ClientSession()
+        self.session = None
+        self.session_factory = aiohttp.ClientSession
         self.base_url = "https://members-ng.iracing.com"
 
         self.username = username
         self.encoded_password = self._encode_password(username, password)
+
+    async def __aenter__(self):
+        self.session = aiohttp.ClientSession()
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        await self.session.close()
+        self.session = None
 
     def _encode_password(self, username, password):
         initial_hash = hashlib.sha256(
@@ -26,20 +35,14 @@ class irDataClient:
     async def _login(self):
         headers = {"Content-Type": "application/json"}
         data = {"email": self.username, "password": self.encoded_password}
-        r: aiohttp.ClientResponse = None
 
-        async with self.session:
-            try:
-                r = await self.session.post(
-                    "https://members-ng.iracing.com/auth",
-                    headers=headers,
-                    json=data,
-                    timeout=5.0,
-                )
-            except asyncio.TimeoutError:
-                raise RuntimeError("Login timed out")
-            except aiohttp.ClientConnectionError:
-                raise RuntimeError("Connection error")
+        try:
+            r = await self.session.post(
+                "https://members-ng.iracing.com/auth",
+                headers=headers,
+                json=data,
+                timeout=5.0,
+            )
 
             if r.status == 429:
                 print("Rate limited, waiting")
@@ -58,6 +61,10 @@ class irDataClient:
                 return "Logged in"
             else:
                 raise RuntimeError("Error from iRacing: ", response_data)
+        except asyncio.TimeoutError:
+            raise RuntimeError("Login timed out")
+        except aiohttp.ClientConnectionError:
+            raise RuntimeError("Connection error")
 
     def _build_url(self, endpoint):
         return self.base_url + endpoint
@@ -67,10 +74,7 @@ class irDataClient:
             await self._login()
             return await self._get_resource_or_link(url, payload=payload)
 
-        r: aiohttp.ClientResponse = None
-
-        async with self.session:
-            r = await self.session.get(url, params=payload)
+        r = await self.session.get(url, params=payload)
 
         if r.status == 401:
             # unauthorised, likely due to a timeout, retry after a login
@@ -103,10 +107,7 @@ class irDataClient:
         if not is_link:
             return resource_obj
 
-        r: aiohttp.ClientResponse = None
-
-        async with self.session:
-            r = self.session.get(resource_obj)
+        r = await self.session.get(resource_obj)
 
         if r.status == 401:
             # unauthorised, likely due to a timeout, retry after a login
@@ -138,10 +139,9 @@ class irDataClient:
 
         list_of_chunks = []
 
-        async with self.session:
-            for url in urls:
-                r = await self.session.get(url)
-                list_of_chunks.append(await r.json())
+        for url in urls:
+            r = await self.session.get(url)
+            list_of_chunks.append(await r.json())
 
         output = [item for sublist in list_of_chunks for item in sublist]
 
@@ -440,9 +440,9 @@ class irDataClient:
         if include_licenses:
             payload["include_licenses"] = include_licenses
 
-        resource = self._get_resource("/data/league/roster", payload=payload)
+        resource = await self._get_resource("/data/league/roster", payload=payload)
 
-        return await self._get_resource_or_link(resource["data_url"])[0]
+        return (await self._get_resource_or_link(resource["data_url"]))[0]
 
     async def league_seasons(self, league_id, retired=False):
         """Fetches a list containing all the seasons from a league.
@@ -610,7 +610,9 @@ class irDataClient:
             "subsession_id": subsession_id,
             "simsession_number": simsession_number,
         }
-        resource = self._get_resource("/data/results/lap_chart_data", payload=payload)
+        resource = await self._get_resource(
+            "/data/results/lap_chart_data", payload=payload
+        )
         return await self._get_chunks(resource.get("chunk_info"))
 
     async def result_lap_data(
@@ -862,7 +864,7 @@ class irDataClient:
 
         resource = await self._get_resource("/data/member/awards", payload=payload)
 
-        return await self._get_resource_or_link(resource["data_url"])[0]
+        return (await self._get_resource_or_link(resource["data_url"]))[0]
 
     async def member_chart_data(self, cust_id=None, category_id=2, chart_type=1):
         """Get the irating, ttrating or safety rating chart data of a certain category.
@@ -1284,9 +1286,11 @@ class irDataClient:
         if event_types:
             payload["event_types"] = ",".join([str(x) for x in event_types])
 
-        return await self._get_resource(
+        resource = await self._get_resource(
             "/data/season/spectator_subsessionids", payload=payload
-        )["subsession_ids"]
+        )
+
+        return resource.get("subsession_ids")
 
     async def get_series(self):
         """Get all the current official iRacing series.
@@ -1329,9 +1333,11 @@ class irDataClient:
         """
         payload = {"series_id": series_id}
 
-        return await self._get_resource(
+        resource = await self._get_resource(
             "/data/series/past_seasons", payload=payload
-        ).get("series")
+        )
+
+        return resource.get("series")
 
     async def series_seasons(self, include_series=False):
         """Get the all the seasons.
